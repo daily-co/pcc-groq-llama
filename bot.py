@@ -21,6 +21,10 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.serializers.twilio import TwilioFrameSerializer
+from pipecat.services.groq.llm import GroqLLMService
+from pipecat.services.groq.stt import GroqSTTService
+from pipecat.services.groq.tts import GroqTTSService
+from pipecat.transports.base_transport import BaseTransport
 from pipecat.transports.network.fastapi_websocket import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
@@ -31,10 +35,6 @@ from pipecatcloud.agent import (
     SessionArguments,
     WebSocketSessionArguments,
 )
-
-from pipecat.services.groq.llm import GroqLLMService
-from pipecat.services.groq.stt import GroqSTTService
-from pipecat.services.groq.tts import GroqTTSService
 
 from runner import configure
 
@@ -57,8 +57,95 @@ async def fetch_weather_from_api(function_name, tool_call_id, args, llm, context
     await result_callback({"conditions": "nice", "temperature": "75"})
 
 
-async def main(args: SessionArguments):
+async def main(transport: BaseTransport, args: SessionArguments):
+    stt = GroqSTTService(api_key=os.getenv("GROQ_API_KEY"), model="distil-whisper-large-v3-en")
+
+    tts = GroqTTSService(api_key=os.getenv("GROQ_API_KEY"))
+
+    llm = GroqLLMService(
+        api_key=os.getenv("GROQ_API_KEY"), model="meta-llama/llama-4-scout-17b-16e-instruct"
+    )
+    # You can also register a function_name of None to get all functions
+    # sent to the same callback with an additional function_name parameter.
+    llm.register_function("get_current_weather", fetch_weather_from_api)
+
+    weather_function = FunctionSchema(
+        name="get_current_weather",
+        description="Get the current weather",
+        properties={
+            "location": {
+                "type": "string",
+                "description": "The city and state, e.g. San Francisco, CA",
+            },
+            "format": {
+                "type": "string",
+                "enum": ["celsius", "fahrenheit"],
+                "description": "The temperature unit to use. Infer this from the user's location.",
+            },
+        },
+        required=["location"],
+    )
+    tools = ToolsSchema(standard_tools=[weather_function])
+    messages = [
+        {
+            "role": "system",
+            "content": instructions,
+        },
+    ]
+
+    context = OpenAILLMContext(messages, tools)
+    context_aggregator = llm.create_context_aggregator(context)
+
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            stt,
+            context_aggregator.user(),
+            llm,
+            tts,
+            transport.output(),
+            context_aggregator.assistant(),
+        ]
+    )
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            allow_interruptions=True,
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+    )
+
     if isinstance(args, WebSocketSessionArguments):
+
+        @transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, client):
+            logger.info(f"Client connected: {client}")
+            # Kick off the conversation
+            await task.queue_frames([context_aggregator.user().get_context_frame()])
+
+        @transport.event_handler("on_client_disconnected")
+        async def on_client_disconnected(transport, client):
+            logger.info(f"Client disconnected: {client}")
+            await task.cancel()
+    elif isinstance(args, DailySessionArguments):
+
+        @transport.event_handler("on_first_participant_joined")
+        async def on_first_participant_joined(transport, participant):
+            await task.queue_frames([context_aggregator.user().get_context_frame()])
+
+        @transport.event_handler("on_participant_left")
+        async def on_participant_left(transport, participant, reason):
+            await task.cancel()
+
+    runner = PipelineRunner(handle_sigint=False, force_gc=True)
+
+    await runner.run(task)
+
+
+async def bot(args: SessionArguments):
+    try:
         logger.debug("Starting WebSocket bot")
 
         start_data = args.websocket.iter_text()
@@ -77,111 +164,7 @@ async def main(args: SessionArguments):
                 serializer=TwilioFrameSerializer(stream_sid),
             ),
         )
-    elif isinstance(args, DailySessionArguments):
-        logger.debug("Starting Daily bot")
-        transport = DailyTransport(
-            args.room_url,
-            args.token,
-            "Respond bot",
-            DailyParams(
-                audio_in_enabled=True,
-                audio_out_enabled=True,
-                transcription_enabled=False,
-                vad_enabled=True,
-                vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.5)),
-                vad_audio_passthrough=True,
-            ),
-        )
-
-        stt = GroqSTTService(api_key=os.getenv("GROQ_API_KEY"), model="distil-whisper-large-v3-en")
-
-        tts = GroqTTSService(api_key=os.getenv("GROQ_API_KEY"))
-
-        llm = GroqLLMService(
-            api_key=os.getenv("GROQ_API_KEY"), model="meta-llama/llama-4-scout-17b-16e-instruct"
-        )
-        # You can also register a function_name of None to get all functions
-        # sent to the same callback with an additional function_name parameter.
-        llm.register_function("get_current_weather", fetch_weather_from_api)
-
-        weather_function = FunctionSchema(
-            name="get_current_weather",
-            description="Get the current weather",
-            properties={
-                "location": {
-                    "type": "string",
-                    "description": "The city and state, e.g. San Francisco, CA",
-                },
-                "format": {
-                    "type": "string",
-                    "enum": ["celsius", "fahrenheit"],
-                    "description": "The temperature unit to use. Infer this from the user's location.",
-                },
-            },
-            required=["location"],
-        )
-        tools = ToolsSchema(standard_tools=[weather_function])
-        messages = [
-            {
-                "role": "system",
-                "content": instructions,
-            },
-        ]
-
-        context = OpenAILLMContext(messages, tools)
-        context_aggregator = llm.create_context_aggregator(context)
-
-        pipeline = Pipeline(
-            [
-                transport.input(),
-                stt,
-                context_aggregator.user(),
-                llm,
-                tts,
-                transport.output(),
-                context_aggregator.assistant(),
-            ]
-        )
-
-        task = PipelineTask(
-            pipeline,
-            params=PipelineParams(
-                allow_interruptions=True,
-                enable_metrics=True,
-                enable_usage_metrics=True,
-            ),
-        )
-
-        if isinstance(args, WebSocketSessionArguments):
-
-            @transport.event_handler("on_client_connected")
-            async def on_client_connected(transport, client):
-                logger.info(f"Client connected: {client}")
-                # Kick off the conversation
-                await task.queue_frames([context_aggregator.user().get_context_frame()])
-
-            @transport.event_handler("on_client_disconnected")
-            async def on_client_disconnected(transport, client):
-                logger.info(f"Client disconnected: {client}")
-                await task.cancel()
-        elif isinstance(args, DailySessionArguments):
-
-            @transport.event_handler("on_first_participant_joined")
-            async def on_first_participant_joined(transport, participant):
-                await task.queue_frames([context_aggregator.user().get_context_frame()])
-
-            @transport.event_handler("on_participant_left")
-            async def on_participant_left(transport, participant, reason):
-                await task.cancel()
-
-        runner = PipelineRunner(handle_sigint=False, force_gc=True)
-
-        await runner.run(task)
-
-
-async def bot(args: SessionArguments):
-    try:
-        await main(args)
+        await main(transport, args)
         logger.info("Bot process completed")
     except Exception as e:
         logger.exception(f"Error in bot process: {str(e)}")
@@ -197,15 +180,27 @@ async def local():
         if os.getenv("DAILY_API_KEY"):
             (room_url, token) = await configure(session)
 
-            await main(
-                DailySessionArguments(
-                    session_id=None,
-                    room_url=room_url,
-                    token=token,
-                    body=None,
-                )
+            logger.debug("Starting Daily bot")
+            args = DailySessionArguments(
+                session_id=None,
+                room_url=room_url,
+                token=token,
+                body=None,
             )
-
+            transport = DailyTransport(
+                args.room_url,
+                args.token,
+                "Respond bot",
+                DailyParams(
+                    audio_in_enabled=True,
+                    audio_out_enabled=True,
+                    transcription_enabled=False,
+                    vad_enabled=True,
+                    vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.5)),
+                    vad_audio_passthrough=True,
+                ),
+            )
+            await main(transport, args)
         else:
             logger.error("DAILY_API_KEY must be set in your .env file for local testing.")
 
