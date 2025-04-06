@@ -1,4 +1,6 @@
-# Groq Voice AI Web and Phone Bot
+# Groq Voice AI Web and Phone Starter Kit
+
+## Groq + Llama 4 + Pipecat + function calling + (optionally) Twilio
 
 A conversational agent built with Pipecat, powered by Groq's APIs and Llama 4. Ask it about the weather!
 
