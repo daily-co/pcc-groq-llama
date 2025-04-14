@@ -1,5 +1,6 @@
 pipecatcloud
-pipecat-ai[groq,daily,silero]==0.0.62
+pipecat-ai[groq,daily,webrtc,silero]==0.0.63
+pipecat-ai-small-webrtc-prebuilt
 python-dotenv
 fastapi
 uvicorn

@@ -4,12 +4,10 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-import asyncio
 import json
 import os
 import sys
 
-import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
@@ -26,6 +24,9 @@ from pipecat.transports.network.fastapi_websocket import (
     FastAPIWebsocketTransport,
 )
 from pipecat.transports.services.daily import DailyParams, DailyTransport
+from pipecat.transports.network.webrtc_connection import SmallWebRTCConnection
+from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
 from pipecatcloud.agent import (
     DailySessionArguments,
     SessionArguments,
@@ -36,7 +37,6 @@ from pipecat.services.groq.llm import GroqLLMService
 from pipecat.services.groq.stt import GroqSTTService
 from pipecat.services.groq.tts import GroqTTSService
 
-from runner import configure
 
 load_dotenv(override=True)
 
@@ -92,91 +92,105 @@ async def main(args: SessionArguments):
                 vad_audio_passthrough=True,
             ),
         )
-
-        stt = GroqSTTService(api_key=os.getenv("GROQ_API_KEY"), model="distil-whisper-large-v3-en")
-
-        tts = GroqTTSService(api_key=os.getenv("GROQ_API_KEY"))
-
-        llm = GroqLLMService(
-            api_key=os.getenv("GROQ_API_KEY"), model="meta-llama/llama-4-scout-17b-16e-instruct"
-        )
-        # You can also register a function_name of None to get all functions
-        # sent to the same callback with an additional function_name parameter.
-        llm.register_function("get_current_weather", fetch_weather_from_api)
-
-        weather_function = FunctionSchema(
-            name="get_current_weather",
-            description="Get the current weather",
-            properties={
-                "location": {
-                    "type": "string",
-                    "description": "The city and state, e.g. San Francisco, CA",
-                },
-                "format": {
-                    "type": "string",
-                    "enum": ["celsius", "fahrenheit"],
-                    "description": "The temperature unit to use. Infer this from the user's location.",
-                },
-            },
-            required=["location"],
-        )
-        tools = ToolsSchema(standard_tools=[weather_function])
-        messages = [
-            {
-                "role": "system",
-                "content": instructions,
-            },
-        ]
-
-        context = OpenAILLMContext(messages, tools)
-        context_aggregator = llm.create_context_aggregator(context)
-
-        pipeline = Pipeline(
-            [
-                transport.input(),
-                stt,
-                context_aggregator.user(),
-                llm,
-                tts,
-                transport.output(),
-                context_aggregator.assistant(),
-            ]
-        )
-
-        task = PipelineTask(
-            pipeline,
-            params=PipelineParams(
-                allow_interruptions=True,
-                enable_metrics=True,
-                enable_usage_metrics=True,
+    elif isinstance(args, SmallWebRTCConnection):
+        logger.debug("Starting SmallWebRTC bot")
+        transport = SmallWebRTCTransport(
+            webrtc_connection=args,
+            params=TransportParams(
+                audio_in_enabled=True,
+                audio_out_enabled=True,
+                vad_enabled=True,
+                vad_analyzer=SileroVADAnalyzer(),
+                vad_audio_passthrough=True,
             ),
         )
+    else:
+        raise ValueError(f"Unsupported session arguments type: {type(args)}")
 
-        if isinstance(args, WebSocketSessionArguments):
+    stt = GroqSTTService(api_key=os.getenv("GROQ_API_KEY"), model="distil-whisper-large-v3-en")
 
-            @transport.event_handler("on_client_connected")
-            async def on_client_connected(transport, client):
-                logger.info(f"Client connected: {client}")
-                # Kick off the conversation
-                await task.queue_frames([context_aggregator.user().get_context_frame()])
+    tts = GroqTTSService(api_key=os.getenv("GROQ_API_KEY"))
 
-            @transport.event_handler("on_client_disconnected")
-            async def on_client_disconnected(transport, client):
-                logger.info(f"Client disconnected: {client}")
-                await task.cancel()
-        elif isinstance(args, DailySessionArguments):
+    llm = GroqLLMService(
+        api_key=os.getenv("GROQ_API_KEY"), model="meta-llama/llama-4-scout-17b-16e-instruct"
+    )
+    # You can also register a function_name of None to get all functions
+    # sent to the same callback with an additional function_name parameter.
+    llm.register_function("get_current_weather", fetch_weather_from_api)
 
-            @transport.event_handler("on_first_participant_joined")
-            async def on_first_participant_joined(transport, participant):
-                await task.queue_frames([context_aggregator.user().get_context_frame()])
+    weather_function = FunctionSchema(
+        name="get_current_weather",
+        description="Get the current weather",
+        properties={
+            "location": {
+                "type": "string",
+                "description": "The city and state, e.g. San Francisco, CA",
+            },
+            "format": {
+                "type": "string",
+                "enum": ["celsius", "fahrenheit"],
+                "description": "The temperature unit to use. Infer this from the user's location.",
+            },
+        },
+        required=["location"],
+    )
+    tools = ToolsSchema(standard_tools=[weather_function])
+    messages = [
+        {
+            "role": "system",
+            "content": instructions,
+        },
+    ]
 
-            @transport.event_handler("on_participant_left")
-            async def on_participant_left(transport, participant, reason):
-                await task.cancel()
+    context = OpenAILLMContext(messages, tools)
+    context_aggregator = llm.create_context_aggregator(context)
 
-        runner = PipelineRunner(handle_sigint=False, force_gc=True)
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            stt,
+            context_aggregator.user(),
+            llm,
+            tts,
+            transport.output(),
+            context_aggregator.assistant(),
+        ]
+    )
 
-        await runner.run(task)
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            allow_interruptions=True,
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+    )
+
+    if isinstance(args, WebSocketSessionArguments):
+
+        @transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, client):
+            logger.info(f"Client connected: {client}")
+            # Kick off the conversation
+            await task.queue_frames([context_aggregator.user().get_context_frame()])
+
+        @transport.event_handler("on_client_disconnected")
+        async def on_client_disconnected(transport, client):
+            logger.info(f"Client disconnected: {client}")
+            await task.cancel()
+    elif isinstance(args, DailySessionArguments):
+
+        @transport.event_handler("on_first_participant_joined")
+        async def on_first_participant_joined(transport, participant):
+            await task.queue_frames([context_aggregator.user().get_context_frame()])
+
+        @transport.event_handler("on_participant_left")
+        async def on_participant_left(transport, participant, reason):
+            await task.cancel()
+
+    runner = PipelineRunner(handle_sigint=False, force_gc=True)
+
+    await runner.run(task)
 
 
 async def bot(args: SessionArguments):
@@ -188,29 +202,11 @@ async def bot(args: SessionArguments):
         raise
 
 
-async def local():
-    logger.info("Starting local bot")
+if __name__ == "__main__":
+    from local_development_runner import local_development_main
+
     logger.remove()
     logger.add(sys.stderr, level="DEBUG")
 
-    async with aiohttp.ClientSession() as session:
-        if os.getenv("DAILY_API_KEY"):
-            (room_url, token) = await configure(session)
-
-            await main(
-                DailySessionArguments(
-                    session_id=None,
-                    room_url=room_url,
-                    token=token,
-                    body=None,
-                )
-            )
-
-        else:
-            logger.error("DAILY_API_KEY must be set in your .env file for local testing.")
-
-
-print("Module name:", __name__)
-if __name__ == "__main__":
-    print("Running bot.py as main script")
-    asyncio.run(local())
+    logger.info("Starting local development mode")
+    local_development_main()
