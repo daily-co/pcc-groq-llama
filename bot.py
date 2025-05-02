@@ -33,6 +33,7 @@ from pipecatcloud.agent import (
 from pipecat.services.groq.llm import GroqLLMService
 from pipecat.services.groq.stt import GroqSTTService
 from pipecat.services.groq.tts import GroqTTSService
+from pipecat.processors.aggregators.llm_response import LLMUserAggregatorParams
 
 
 load_dotenv(override=True)
@@ -114,7 +115,7 @@ async def main(args: SessionArguments):
     tts = GroqTTSService(api_key=os.getenv("GROQ_API_KEY"))
 
     llm = GroqLLMService(
-        api_key=os.getenv("GROQ_API_KEY"), model="meta-llama/llama-4-scout-17b-16e-instruct"
+        api_key=os.getenv("GROQ_API_KEY"), model="meta-llama/llama-4-maverick-17b-128e-instruct"
     )
     # You can also register a function_name of None to get all functions
     # sent to the same callback with an additional function_name parameter.
@@ -145,7 +146,9 @@ async def main(args: SessionArguments):
     ]
 
     context = OpenAILLMContext(messages, tools)
-    context_aggregator = llm.create_context_aggregator(context)
+    context_aggregator = llm.create_context_aggregator(
+        context, user_params=LLMUserAggregatorParams(aggregation_timeout=0.05)
+    )
 
     pipeline = Pipeline(
         [
