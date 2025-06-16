@@ -1,0 +1,3 @@
+[submodule "pipecat-subrepo"]
+	path = pipecat-subrepo
+	url = https://github.com/pipecat-ai/pipecat.git
