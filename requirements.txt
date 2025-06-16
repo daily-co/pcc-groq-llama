@@ -1,5 +1,5 @@
 pipecatcloud
-pipecat-ai[groq,daily,webrtc,silero]==0.0.71
+-e ./pipecat[groq,daily,webrtc,silero]
 pipecat-ai-small-webrtc-prebuilt
 python-dotenv
 fastapi
