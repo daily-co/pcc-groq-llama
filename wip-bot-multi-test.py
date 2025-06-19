@@ -6,7 +6,6 @@
 
 import json
 import os
-import re
 import sys
 
 from dataclasses import dataclass
@@ -37,8 +36,6 @@ from pipecat.frames.frames import (
     LLMTextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
-    TTSStartedFrame,
-    TTSStoppedFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.groq.llm import GroqLLMService
@@ -46,6 +43,7 @@ from pipecat.services.groq.stt import GroqSTTService
 from pipecat.services.groq.tts import GroqTTSService
 from pipecat.processors.aggregators.llm_response import LLMUserAggregatorParams
 
+import unicodedata
 
 load_dotenv(override=True)
 
@@ -86,6 +84,7 @@ class LanguageTagger(FrameProcessor):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.current_language = LanguageTagger.EN_TAG
         self.segments: list[LanguageTagger.Segment] = []
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -106,27 +105,19 @@ class LanguageTagger(FrameProcessor):
             await self.flush_language_segment()
 
         if isinstance(frame, LLMTextFrame):
-            logger.debug(f"!!! LLMTextFrame: {frame.text}")
-            match = re.match(r"(.*)(" + self.EN_TAG + r"|" + self.AR_TAG + r")(.*)", frame.text)
-            if match:
-                pre_text = match.group(1)
-                language = match.group(2)
-                post_text = match.group(3)
-                if pre_text.strip():
-                    await self.push_text(pre_text)
-                await self.create_segment(language)
-                if post_text.strip():
-                    await self.push_text(post_text)
-                return
-            else:
-                await self.push_text(frame)
-                return
+            detected_language = self.detect_language(frame.text)
+            logger.debug(f"!!! [{frame.text}] - {detected_language}")
+            if detected_language and detected_language != self.current_language:
+                self.current_language = detected_language
+                await self.create_segment(detected_language)
+            await self.push_text(frame)
+            return
 
         await self.push_frame(frame, direction)
 
     async def create_segment(self, language: str):
         should_buffer = len(self.segments) > 0
-        logger.debug(f"!!! creating segment: {language}, should_buffer: {should_buffer}")
+        logger.debug(f"Creating segment: {language}, should_buffer: {should_buffer}")
         self.segments.append(
             LanguageTagger.Segment(language=language, text=[], buffered=should_buffer)
         )
@@ -146,28 +137,41 @@ class LanguageTagger(FrameProcessor):
             else LLMTextFrame(text=text_or_frame)
         )
         if not self.segments[-1].buffered:
-            logger.debug(f"!!! pushing frame: {frame}")
             await self.push_frame(frame)
         else:
             self.segments[-1].text.append(frame)
 
     async def flush_language_segment(self):
-        logger.debug("!!! flushing_language_segment top")
         if not self.segments:
             return
         segment = self.segments.pop(0)
-        logger.debug("!!! flushing_language_segment A")
-        # If this segment is buffered we can just push the end frame and we're done
         if not segment.buffered:
-            logger.debug("!!! pushing LLMFullResponseEndFrame")
             await self.push_frame(LLMFullResponseEndFrame())
             return
-        # Otherwise we need to push the language tag, start frame, and text frames
         await self.push_frame(LanguageTagFrame(language=segment.language))
         await self.push_frame(LLMFullResponseStartFrame())
         for text_frame in segment.text:
             await self.push_frame(text_frame)
         await self.push_frame(LLMFullResponseEndFrame())
+
+    def detect_language(self, text: str) -> str:
+        arabic_count = 0
+        english_count = 0
+
+        for char in text:
+            if char.isalpha():
+                name = unicodedata.name(char, "")
+                if "ARABIC" in name:
+                    arabic_count += 1
+                elif "LATIN" in name:
+                    english_count += 1
+
+        if arabic_count > english_count:
+            return LanguageTagger.AR_TAG
+        elif english_count > arabic_count:
+            return LanguageTagger.EN_TAG
+        else:
+            return ""
 
 
 class LanguageGate(FrameProcessor):
@@ -201,12 +205,11 @@ class TTSSegmentSequencer(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, LLMFullResponseEndFrame):
-            logger.debug("!!! pushing NextLanguageSequenceFrame upstream")
             await self.push_frame(NextLanguageSequenceFrame(), direction=FrameDirection.UPSTREAM)
         await self.push_frame(frame, direction)
 
 
-instructions = f"""
+instructions = """
 You are a helpful assistant in a voice conversation. Your goal is to respond in a friendly, creative, and succinct way to the user's statements and questions. Your output will be converted to audio so don't include special characters in your answers.
 
 Keep your answers short unless asked to perform a task that requires a long answer, or asked to provide detail.
@@ -218,40 +221,8 @@ You understand both English and Arabic. You can respond in either language.
 - By default, respond in the language the user used most recently.
 - Follow user instructions to switch languages.
 - Translate between languages as requested or as appropriate.
-
-# Rules for formatting
-
-## At the beginning of each response, prepend the language you are using as either {LanguageTagger.EN_TAG} or {LanguageTagger.AR_TAG}.
-
-Example:
-
-{LanguageTagger.EN_TAG}
-How are you today?
-
-## Whenever you switch languages while responding, insert the language tag {LanguageTagger.EN_TAG} or {LanguageTagger.AR_TAG}.
-
-Example switching between languages 1:
-
-{LanguageTagger.EN_TAG}
-How are you today? Translates as ...
-{LanguageTagger.AR_TAG}
-مرحباً، سعيدٌ بكونك هنا!
-
-Example switching between languages 2:
-
-{LanguageTagger.EN_TAG}
-I will count in both languages, alternating between them.
-two,
-{LanguageTagger.AR_TAG}
-ثلاثة,
-{LanguageTagger.EN_TAG}
-four
-{LanguageTagger.AR_TAG}
-خمسة,
-{LanguageTagger.EN_TAG}
-six
-{LanguageTagger.AR_TAG}
-سبعة,
+- Do not use transliterated text in your responses.
+- Do not use formatting, such as bold or italics or list, in your responses.
 """
 
 
@@ -349,23 +320,6 @@ async def main(args: SessionArguments):
         context, user_params=LLMUserAggregatorParams(aggregation_timeout=0.05)
     )
 
-    class showme(FrameProcessor):
-        async def process_frame(self, frame: Frame, direction: FrameDirection):
-            await super().process_frame(frame, direction)
-            if (
-                isinstance(frame, TTSStartedFrame)
-                or isinstance(frame, TTSStoppedFrame)
-                or isinstance(frame, LLMFullResponseEndFrame)
-            ):
-                logger.debug(f"!!! {self.__class__.__name__}: {frame}")
-            await self.push_frame(frame, direction)
-
-    class showme_en(showme):
-        pass
-
-    class showme_ar(showme):
-        pass
-
     pipeline = Pipeline(
         [
             transport.input(),
@@ -374,8 +328,8 @@ async def main(args: SessionArguments):
             llm,
             language_tagger,
             ParallelPipeline(
-                [language_gate_en, tts_en, showme_en()],
-                [language_gate_ar, tts_ar, showme_ar()],
+                [language_gate_en, tts_en],
+                [language_gate_ar, tts_ar],
             ),
             tts_sequencer,
             transport.output(),
