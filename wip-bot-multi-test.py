@@ -37,6 +37,8 @@ from pipecat.frames.frames import (
     LLMTextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.groq.llm import GroqLLMService
@@ -47,54 +49,6 @@ from pipecat.processors.aggregators.llm_response import LLMUserAggregatorParams
 
 load_dotenv(override=True)
 
-instructions = """
-You are a helpful assistant in a voice conversation. Your goal is to respond in a friendly, creative, and succinct way to the user's statements and questions. Your output will be converted to audio so don't include special characters in your answers.
-
-Keep your answers short unless asked to perform a task that requires a long answer, or asked to provide detail.
-
-You understand both English and Arabic. You can respond in either language.
-
-# Rules for responding
-
-- By default, respond in the language the user used most recently.
-- Follow user instructions to switch languages.
-- Translate between languages as requested or as appropriate.
-
-# Rules for formatting
-
-## At the beginning of each response, prepend the language you are using as either EN or AR.
-
-Example:
-
-EN
-How are you today?
-
-## Whenever you switch languages while responding, insert the language tag EN or AR.
-
-Example switching between languages 1:
-
-EN
-How are you today? Translates as ...
-AR
-مرحباً، سعيدٌ بكونك هنا!
-
-Example switching between languages 2:
-
-EN
-I will count in both languages, alternating between them.
-two,
-AR
-ثلاثة,
-EN
-four
-AR
-خمسة,
-EN
-six
-AR
-سبعة,
-"""
-
 
 @dataclass
 class LanguageTagFrame(Frame):
@@ -103,13 +57,15 @@ class LanguageTagFrame(Frame):
     language: str
 
 
-class TestSTTService(GroqSTTService):
-    def language_to_service_language(self, language: str) -> str:
-        logger.info("Setting whisper to multi-lingual (no language specified)")
-        return ""
-
-
 class LanguageTagger(FrameProcessor):
+    """Frame processor to remove single-token language tags from the LLM
+    output stream and replace them with LanguageTagFrames"""
+
+    # Pick strings for our language tags that are single tokens and not expected
+    # in normal text output.
+    EN_TAG = "EN"
+    AR_TAG = "AR"
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.current_language = None
@@ -120,14 +76,9 @@ class LanguageTagger(FrameProcessor):
         if isinstance(frame, LLMFullResponseEndFrame):
             self.current_language = None
 
-        if isinstance(frame, LLMFullResponseStartFrame) or isinstance(
-            frame, LLMFullResponseEndFrame
-        ):
-            logger.debug(f"!!! Start/End frame: {frame}")
-
         if isinstance(frame, LLMTextFrame):
-            logger.info(f"Received text frame: {frame}")
-            match = re.match(r"(.*)(EN|AR)(.*)", frame.text)
+            logger.debug(f"!!! LLMTextFrame: {frame.text}")
+            match = re.match(r"(.*)(" + self.EN_TAG + r"|" + self.AR_TAG + r")(.*)", frame.text)
             if match:
                 # in this branch we need to return so we don't push the incoming frame
                 pre_text = match.group(1)
@@ -138,7 +89,7 @@ class LanguageTagger(FrameProcessor):
                 if pre_text.strip():
                     await self.push_frame(LLMTextFrame(text=pre_text))
                 if switching:
-                    logger.debug("!!! Switching languages")
+                    logger.debug(f"!!! Switching to {language}")
                     await self.push_frame(LLMFullResponseEndFrame())
                     await self.push_frame(LanguageTagFrame(language=language))
                     await self.push_frame(LLMFullResponseStartFrame())
@@ -152,6 +103,9 @@ class LanguageTagger(FrameProcessor):
 
 
 class LanguageGate(FrameProcessor):
+    """Frame processor that opens and closes a pipeline based on language tags.
+    This directs the language-specific LLM response segments to the correct TTS element."""
+
     def __init__(self, language, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.language = language
@@ -173,6 +127,122 @@ class LanguageGate(FrameProcessor):
 
         if self._should_passthrough_frame(frame):
             await self.push_frame(frame, direction)
+
+
+class TTSSegmentSequencer(FrameProcessor):
+    """Frame processor that ensures TTS segments are sent out in the correct order.
+    This is necessary because TTS output can arrive from the separate TTS pipelines in any order.
+    We handle this by running only one TTS pipeline at a time. TTS models still generate faster
+    than realtime, so this should never introduce any delays.
+
+    The frame flow is:
+        LanguageTagFrame,
+        LLMFullResponseStartFrame, LLMTextFrame ... LLMFullResponseEndFrame
+        TTSStartedFrame, TTSAudioRawFrame ... TTSStoppedFrame
+
+    TTSSegmentSequencer tracks segment order
+    - The pipeline starts with all tts element paused
+    - When the TTSSegmentSequencer sees a LanguageTagFrame
+    -   Pushes the language tag onto the end of a list
+    -   If all processors are paused, it pops the list and sends a
+        FrameProcessorResumeUrgentFrame upstream to the processor for the language tag
+    - When the TTSSegmentSequencer sees a TTSStoppedFrame
+    -   It pauses the processor that just finished
+    -   It pops the list and sends a FrameProcessorResumeUrgentFrame upstream to the processor for the language tag
+    """
+
+    def __init__(self, processor_map: dict[str, FrameProcessor], *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.language_tag_list = []
+        self.processor_map = processor_map
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, LanguageTagFrame):
+            logger.debug(f"!!! Sequencing for {frame.language}")
+            self.language_tag_list.append(frame.language)
+            if len(self.language_tag_list) == 1:
+                for processor in self.processor_map.values():
+                    await processor.pause_processing_frames()
+                await self.processor_map[self.language_tag_list[-1]].resume_processing_frames()
+
+            #     await self.push_frame(
+            #         FrameProcessorResumeUrgentFrame(
+            #             processor=self.processor_map[self.language_tag_list[-1]]
+            #         ),
+            #         direction=FrameDirection.UPSTREAM,
+            # )
+
+        if isinstance(frame, LLMFullResponseEndFrame):
+            logger.debug(f"!!! Stopping sequence for {self.language_tag_list}")
+            language = self.language_tag_list.pop(0)
+            logger.debug(f"!!! double check for {language} {self.language_tag_list}")
+            await self.processor_map[language].pause_processing_frames()
+            if len(self.language_tag_list) > 0:
+                logger.debug(f"!!! Resuming sequence for {self.language_tag_list[0]}")
+                await self.processor_map[self.language_tag_list[0]].resume_processing_frames()
+            # await self.push_frame(
+            #     FrameProcessorPauseUrgentFrame(processor=self.processor_map[language]),
+            #     direction=FrameDirection.UPSTREAM,
+            # )
+
+        await self.push_frame(frame, direction)
+
+
+instructions = f"""
+You are a helpful assistant in a voice conversation. Your goal is to respond in a friendly, creative, and succinct way to the user's statements and questions. Your output will be converted to audio so don't include special characters in your answers.
+
+Keep your answers short unless asked to perform a task that requires a long answer, or asked to provide detail.
+
+You understand both English and Arabic. You can respond in either language.
+
+# Rules for responding
+
+- By default, respond in the language the user used most recently.
+- Follow user instructions to switch languages.
+- Translate between languages as requested or as appropriate.
+
+# Rules for formatting
+
+## At the beginning of each response, prepend the language you are using as either {LanguageTagger.EN_TAG} or {LanguageTagger.AR_TAG}.
+
+Example:
+
+{LanguageTagger.EN_TAG}
+How are you today?
+
+## Whenever you switch languages while responding, insert the language tag {LanguageTagger.EN_TAG} or {LanguageTagger.AR_TAG}.
+
+Example switching between languages 1:
+
+{LanguageTagger.EN_TAG}
+How are you today? Translates as ...
+{LanguageTagger.AR_TAG}
+مرحباً، سعيدٌ بكونك هنا!
+
+Example switching between languages 2:
+
+{LanguageTagger.EN_TAG}
+I will count in both languages, alternating between them.
+two,
+{LanguageTagger.AR_TAG}
+ثلاثة,
+{LanguageTagger.EN_TAG}
+four
+{LanguageTagger.AR_TAG}
+خمسة,
+{LanguageTagger.EN_TAG}
+six
+{LanguageTagger.AR_TAG}
+سبعة,
+"""
+
+
+class TestSTTService(GroqSTTService):
+    def language_to_service_language(self, language: str) -> str:
+        logger.info("Setting whisper to multi-lingual (no language specified)")
+        return ""
 
 
 async def main(args: SessionArguments):
@@ -242,25 +312,43 @@ async def main(args: SessionArguments):
         api_key=os.getenv("GROQ_API_KEY"), model="meta-llama/llama-4-maverick-17b-128e-instruct"
     )
 
-    language_tagger = LanguageTagger()
     language_gate_en = LanguageGate(language="EN")
     language_gate_ar = LanguageGate(language="AR")
+    language_tagger = LanguageTagger()
+    tts_sequencer = TTSSegmentSequencer(processor_map={"EN": tts_en, "AR": tts_ar})
 
     messages = [
         {
             "role": "system",
             "content": instructions,
         },
-        {
-            "role": "user",
-            "content": "Ask me how I am doing today, and then translate what you asked into Arabic.",
-        },
+        # {
+        #     "role": "user",
+        #     "content": "Ask me how I am doing today, and then translate what you asked into Arabic.",
+        # },
     ]
 
     context = OpenAILLMContext(messages)
     context_aggregator = llm.create_context_aggregator(
         context, user_params=LLMUserAggregatorParams(aggregation_timeout=0.05)
     )
+
+    class showme(FrameProcessor):
+        async def process_frame(self, frame: Frame, direction: FrameDirection):
+            await super().process_frame(frame, direction)
+            if (
+                isinstance(frame, TTSStartedFrame)
+                or isinstance(frame, TTSStoppedFrame)
+                or isinstance(frame, LLMFullResponseEndFrame)
+            ):
+                logger.debug(f"!!! {self.__class__.__name__}: {frame}")
+            await self.push_frame(frame, direction)
+
+    class showme_en(showme):
+        pass
+
+    class showme_ar(showme):
+        pass
 
     pipeline = Pipeline(
         [
@@ -270,9 +358,10 @@ async def main(args: SessionArguments):
             llm,
             language_tagger,
             ParallelPipeline(
-                [language_gate_en, tts_en],
-                [language_gate_ar, tts_ar],
+                [language_gate_en, tts_en, showme_en()],
+                [language_gate_ar, tts_ar, showme_ar()],
             ),
+            tts_sequencer,
             transport.output(),
             context_aggregator.assistant(),
         ]
@@ -302,7 +391,11 @@ async def main(args: SessionArguments):
         async def on_client_connected(transport, client):
             logger.info("Client connected")
             # Kick off the conversation.
-            await task.queue_frames([context_aggregator.user().get_context_frame()])
+            await task.queue_frames(
+                [
+                    context_aggregator.user().get_context_frame(),
+                ]
+            )
 
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client):
