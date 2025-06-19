@@ -62,6 +62,11 @@ class NextLanguageSequenceFrame(Frame):
     pass
 
 
+# buffering logic
+#  When a segment starts, decide whether to buffer
+#  When we get a flush, we don't need to push anything for non-buffered segments
+
+
 class LanguageTagger(FrameProcessor):
     """Frame processor to remove single-token language tags from the LLM
     output stream, buffer text segments, and emit text segments with language tags."""
@@ -71,33 +76,34 @@ class LanguageTagger(FrameProcessor):
     EN_TAG = "EN"
     AR_TAG = "AR"
 
-    # defin a Segment data type that is a tuple of (language, text)
+    # define a Segment data type that is a tuple of (language, text)
     # use @dataclass to define the Segment data type
     @dataclass
     class Segment:
         language: str
         text: list[LLMTextFrame]
+        buffered: bool = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.buffering = False
         self.segments: list[LanguageTagger.Segment] = []
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, LLMFullResponseStartFrame):
-            # Clear the segments buffer. We will send LLMFullResponseStartFrames with each language segment.
+            # Don't automatically push this frame
             self.segments = []
             return
 
         if isinstance(frame, LLMFullResponseEndFrame):
-            await self.flush_language_segments()
-            # Don't push the LLMFullResponseEndFrame; we'll push it as part of each sequence
+            # Don't automatically push this frame
+            await self.flush_language_segment()
             return
 
         if isinstance(frame, NextLanguageSequenceFrame):
-            await self.flush_language_segments()
+            # We expect this frame to come upstream to us from the TTSSegmentSequencer
+            await self.flush_language_segment()
 
         if isinstance(frame, LLMTextFrame):
             logger.debug(f"!!! LLMTextFrame: {frame.text}")
@@ -108,8 +114,7 @@ class LanguageTagger(FrameProcessor):
                 post_text = match.group(3)
                 if pre_text.strip():
                     await self.push_text(pre_text)
-                self.segments.append(LanguageTagger.Segment(language=language, text=[]))
-                await self.push_text(LanguageTagFrame(language=language))
+                await self.create_segment(language)
                 if post_text.strip():
                     await self.push_text(post_text)
                 return
@@ -119,24 +124,45 @@ class LanguageTagger(FrameProcessor):
 
         await self.push_frame(frame, direction)
 
-    async def maybe_push_frame(self, frame: Frame, direction: FrameDirection):
-        pass
+    async def create_segment(self, language: str):
+        should_buffer = len(self.segments) > 0
+        logger.debug(f"!!! creating segment: {language}, should_buffer: {should_buffer}")
+        self.segments.append(
+            LanguageTagger.Segment(language=language, text=[], buffered=should_buffer)
+        )
+        if not should_buffer:
+            await self.push_frame(LanguageTagFrame(language=language))
+            await self.push_frame(LLMFullResponseStartFrame())
 
     async def push_text(self, text_or_frame: str | LLMTextFrame):
         # We expect to always get a language tag at the start of a response. We prompt
         # the LLM to try to make that happen. But, of course, it might not. So if there was
         # no initial language tag, we might need to create a segment here.
         if not self.segments:
-            self.segments.append(LanguageTagger.Segment(language=self.EN_TAG, text=[]))
-        if isinstance(text_or_frame, str):
-            self.segments[-1].text.append(LLMTextFrame(text=text_or_frame))
+            await self.create_segment(self.EN_TAG)
+        frame = (
+            text_or_frame
+            if isinstance(text_or_frame, LLMTextFrame)
+            else LLMTextFrame(text=text_or_frame)
+        )
+        if not self.segments[-1].buffered:
+            logger.debug(f"!!! pushing frame: {frame}")
+            await self.push_frame(frame)
         else:
-            self.segments[-1].text.append(text_or_frame)
+            self.segments[-1].text.append(frame)
 
-    async def flush_language_segments(self):
+    async def flush_language_segment(self):
+        logger.debug("!!! flushing_language_segment top")
         if not self.segments:
             return
         segment = self.segments.pop(0)
+        logger.debug("!!! flushing_language_segment A")
+        # If this segment is buffered we can just push the end frame and we're done
+        if not segment.buffered:
+            logger.debug("!!! pushing LLMFullResponseEndFrame")
+            await self.push_frame(LLMFullResponseEndFrame())
+            return
+        # Otherwise we need to push the language tag, start frame, and text frames
         await self.push_frame(LanguageTagFrame(language=segment.language))
         await self.push_frame(LLMFullResponseStartFrame())
         for text_frame in segment.text:
