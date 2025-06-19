@@ -57,49 +57,91 @@ class LanguageTagFrame(Frame):
     language: str
 
 
+@dataclass
+class NextLanguageSequenceFrame(Frame):
+    pass
+
+
 class LanguageTagger(FrameProcessor):
     """Frame processor to remove single-token language tags from the LLM
-    output stream and replace them with LanguageTagFrames"""
+    output stream, buffer text segments, and emit text segments with language tags."""
 
     # Pick strings for our language tags that are single tokens and not expected
     # in normal text output.
     EN_TAG = "EN"
     AR_TAG = "AR"
 
+    # defin a Segment data type that is a tuple of (language, text)
+    # use @dataclass to define the Segment data type
+    @dataclass
+    class Segment:
+        language: str
+        text: list[LLMTextFrame]
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.current_language = None
+        self.buffering = False
+        self.segments: list[LanguageTagger.Segment] = []
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
+        if isinstance(frame, LLMFullResponseStartFrame):
+            # Clear the segments buffer. We will send LLMFullResponseStartFrames with each language segment.
+            self.segments = []
+            return
+
         if isinstance(frame, LLMFullResponseEndFrame):
-            self.current_language = None
+            await self.flush_language_segments()
+            # Don't push the LLMFullResponseEndFrame; we'll push it as part of each sequence
+            return
+
+        if isinstance(frame, NextLanguageSequenceFrame):
+            await self.flush_language_segments()
 
         if isinstance(frame, LLMTextFrame):
             logger.debug(f"!!! LLMTextFrame: {frame.text}")
             match = re.match(r"(.*)(" + self.EN_TAG + r"|" + self.AR_TAG + r")(.*)", frame.text)
             if match:
-                # in this branch we need to return so we don't push the incoming frame
                 pre_text = match.group(1)
                 language = match.group(2)
                 post_text = match.group(3)
-                switching = self.current_language and self.current_language != language
-                self.current_language = language
                 if pre_text.strip():
-                    await self.push_frame(LLMTextFrame(text=pre_text))
-                if switching:
-                    logger.debug(f"!!! Switching to {language}")
-                    await self.push_frame(LLMFullResponseEndFrame())
-                    await self.push_frame(LanguageTagFrame(language=language))
-                    await self.push_frame(LLMFullResponseStartFrame())
-                else:
-                    await self.push_frame(LanguageTagFrame(language=language))
+                    await self.push_text(pre_text)
+                self.segments.append(LanguageTagger.Segment(language=language, text=[]))
+                await self.push_text(LanguageTagFrame(language=language))
                 if post_text.strip():
-                    await self.push_frame(LLMTextFrame(text=post_text))
+                    await self.push_text(post_text)
+                return
+            else:
+                await self.push_text(frame)
                 return
 
         await self.push_frame(frame, direction)
+
+    async def maybe_push_frame(self, frame: Frame, direction: FrameDirection):
+        pass
+
+    async def push_text(self, text_or_frame: str | LLMTextFrame):
+        # We expect to always get a language tag at the start of a response. We prompt
+        # the LLM to try to make that happen. But, of course, it might not. So if there was
+        # no initial language tag, we might need to create a segment here.
+        if not self.segments:
+            self.segments.append(LanguageTagger.Segment(language=self.EN_TAG, text=[]))
+        if isinstance(text_or_frame, str):
+            self.segments[-1].text.append(LLMTextFrame(text=text_or_frame))
+        else:
+            self.segments[-1].text.append(text_or_frame)
+
+    async def flush_language_segments(self):
+        if not self.segments:
+            return
+        segment = self.segments.pop(0)
+        await self.push_frame(LanguageTagFrame(language=segment.language))
+        await self.push_frame(LLMFullResponseStartFrame())
+        for text_frame in segment.text:
+            await self.push_frame(text_frame)
+        await self.push_frame(LLMFullResponseEndFrame())
 
 
 class LanguageGate(FrameProcessor):
@@ -130,63 +172,11 @@ class LanguageGate(FrameProcessor):
 
 
 class TTSSegmentSequencer(FrameProcessor):
-    """Frame processor that ensures TTS segments are sent out in the correct order.
-    This is necessary because TTS output can arrive from the separate TTS pipelines in any order.
-    We handle this by running only one TTS pipeline at a time. TTS models still generate faster
-    than realtime, so this should never introduce any delays.
-
-    The frame flow is:
-        LanguageTagFrame,
-        LLMFullResponseStartFrame, LLMTextFrame ... LLMFullResponseEndFrame
-        TTSStartedFrame, TTSAudioRawFrame ... TTSStoppedFrame
-
-    TTSSegmentSequencer tracks segment order
-    - The pipeline starts with all tts element paused
-    - When the TTSSegmentSequencer sees a LanguageTagFrame
-    -   Pushes the language tag onto the end of a list
-    -   If all processors are paused, it pops the list and sends a
-        FrameProcessorResumeUrgentFrame upstream to the processor for the language tag
-    - When the TTSSegmentSequencer sees a TTSStoppedFrame
-    -   It pauses the processor that just finished
-    -   It pops the list and sends a FrameProcessorResumeUrgentFrame upstream to the processor for the language tag
-    """
-
-    def __init__(self, processor_map: dict[str, FrameProcessor], *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.language_tag_list = []
-        self.processor_map = processor_map
-
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-
-        if isinstance(frame, LanguageTagFrame):
-            logger.debug(f"!!! Sequencing for {frame.language}")
-            self.language_tag_list.append(frame.language)
-            if len(self.language_tag_list) == 1:
-                for processor in self.processor_map.values():
-                    await processor.pause_processing_frames()
-                await self.processor_map[self.language_tag_list[-1]].resume_processing_frames()
-
-            #     await self.push_frame(
-            #         FrameProcessorResumeUrgentFrame(
-            #             processor=self.processor_map[self.language_tag_list[-1]]
-            #         ),
-            #         direction=FrameDirection.UPSTREAM,
-            # )
-
         if isinstance(frame, LLMFullResponseEndFrame):
-            logger.debug(f"!!! Stopping sequence for {self.language_tag_list}")
-            language = self.language_tag_list.pop(0)
-            logger.debug(f"!!! double check for {language} {self.language_tag_list}")
-            await self.processor_map[language].pause_processing_frames()
-            if len(self.language_tag_list) > 0:
-                logger.debug(f"!!! Resuming sequence for {self.language_tag_list[0]}")
-                await self.processor_map[self.language_tag_list[0]].resume_processing_frames()
-            # await self.push_frame(
-            #     FrameProcessorPauseUrgentFrame(processor=self.processor_map[language]),
-            #     direction=FrameDirection.UPSTREAM,
-            # )
-
+            logger.debug("!!! pushing NextLanguageSequenceFrame upstream")
+            await self.push_frame(NextLanguageSequenceFrame(), direction=FrameDirection.UPSTREAM)
         await self.push_frame(frame, direction)
 
 
@@ -315,7 +305,7 @@ async def main(args: SessionArguments):
     language_gate_en = LanguageGate(language="EN")
     language_gate_ar = LanguageGate(language="AR")
     language_tagger = LanguageTagger()
-    tts_sequencer = TTSSegmentSequencer(processor_map={"EN": tts_en, "AR": tts_ar})
+    tts_sequencer = TTSSegmentSequencer()
 
     messages = [
         {
