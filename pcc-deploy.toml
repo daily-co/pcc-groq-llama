@@ -1,9 +1,0 @@
-agent_name = "pcc-groq-llama"
-image = "makeitmore/pcc-groq-llama:0.1"
-image_credentials = "dockerhub"
-secret_set = "pcc-groq-llama-secrets"
-enable_krisp = true
-
-[scaling]
-min_agents = 1
-max_agents = 50

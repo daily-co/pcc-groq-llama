@@ -156,3 +156,33 @@ Modify the system prompt in `bot.py`:
 ### Adding more function calls
 
 Search for `get_current_weather` in the codebase to find where the existing function calls are registered. Learn all about Pipecat function calling [here](https://docs.pipecat.io/guides/function-calling/).
+
+
+## Running with the provided client
+
+(Note: requires Pipecat Cloud deployment)
+
+Navigate to the [client/](client/) directory and install the project dependencies:
+
+```shell
+npm i
+```
+
+And create a `.env.local` from the example:
+
+```shell
+mv env.example .env.local
+```
+
+This exposes two client-side variables that point to your bot:
+
+```shell
+VITE_PCC_API_KEY=""
+VITE_PCC_API_URL=""
+```
+
+Run the client:
+
+```shell
+npm run dev
+```
