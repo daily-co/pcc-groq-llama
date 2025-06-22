@@ -4,6 +4,13 @@
 
 A conversational agent built with Pipecat, powered by Groq's APIs and Llama 4. Ask it about the weather!
 
+> **Note**: This project temporarily uses a Git submodule checkout of Pipecat at commit `20eebb08e9f059e0800ef3f40429f904becd79d7` instead of the PyPI package. This is a temporary measure until the next Pipecat release. The submodule is located at `./pipecat-subrepo`.
+> 
+> When cloning this repository or switching to this branch, initialize the submodule with:
+> ```bash
+> git submodule update --init --recursive
+> ```
+
 You can deploy this bot to Pipecat Cloud and optionally connect it to Twilio to make it available by phone.
 
 ## Configuration
@@ -42,6 +49,16 @@ INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://localhost:7860 (Press CTRL+C to quit)
 ```
+
+## Arabic
+
+`byt-en-ar.py` can understand and respond in both English and Arabic. This pipeline splits the response into segments for each language and sends them to separate TTS pipelines.
+
+```bash
+python byt-en-ar.py
+```
+
+## Client-side UI
 
 To write your own web, iOS, Android, or C++ clients that connect to this bot, see the [Pipecat Client SDK documentation](https://docs.pipecat.ai/client/introduction).
 
