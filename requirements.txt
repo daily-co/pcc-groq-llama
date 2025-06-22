@@ -1,6 +1,6 @@
 pipecatcloud
 # pipecat-ai[groq,daily,webrtc,silero]==0.0.71  # Using local submodule instead
--e ./pipecat-subrepo[groq,daily,webrtc,silero]
+-e ./pipecat[groq,daily,webrtc,silero]
 pipecat-ai-small-webrtc-prebuilt
 python-dotenv
 fastapi
