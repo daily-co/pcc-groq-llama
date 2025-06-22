@@ -50,6 +50,16 @@ INFO:     Application startup complete.
 INFO:     Uvicorn running on http://localhost:7860 (Press CTRL+C to quit)
 ```
 
+## Arabic
+
+`byt-en-ar.py` can understand and respond in both English and Arabic. This pipeline splits the response into segments for each language and sends them to separate TTS pipelines.
+
+```bash
+python byt-en-ar.py
+```
+
+## Client-side UI
+
 To write your own web, iOS, Android, or C++ clients that connect to this bot, see the [Pipecat Client SDK documentation](https://docs.pipecat.ai/client/introduction).
 
 When you test the bot locally, you are talking to the bot using the Pipecat [serverless WebRTC transport](https://docs.pipecat.ai/server/services/transport/small-webrtc). 
