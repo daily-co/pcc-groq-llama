@@ -52,10 +52,10 @@ INFO:     Uvicorn running on http://localhost:7860 (Press CTRL+C to quit)
 
 ## Arabic
 
-`byt-en-ar.py` can understand and respond in both English and Arabic. This pipeline splits the response into segments for each language and sends them to separate TTS pipelines.
+`bot-en-ar.py` can understand and respond in both English and Arabic. This pipeline splits the response into segments for each language and sends them to separate TTS pipelines.
 
 ```bash
-python byt-en-ar.py
+python bot-en-ar.py
 ```
 
 ## Client-side UI
