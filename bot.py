@@ -120,7 +120,7 @@ async def main(args: SessionArguments):
         else:
             raise ValueError(f"Unsupported session arguments type: {type(args)}")
 
-    stt = GroqSTTService(api_key=os.getenv("GROQ_API_KEY"), model="distil-whisper-large-v3-en")
+    stt = GroqSTTService(api_key=os.getenv("GROQ_API_KEY"), model="whisper-large-v3-turbo")
 
     tts = GroqTTSService(api_key=os.getenv("GROQ_API_KEY"))
 
